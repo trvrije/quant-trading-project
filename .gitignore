@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data
+data/
+
+# Environment files (optional if you export)
+.env
+*.yml
+*.yaml
