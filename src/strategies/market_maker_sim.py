@@ -1,10 +1,15 @@
 """
-Market Maker Simulation (Multi-Asset, Synthetic Order Book)
+Market Maker Simulation (Multi-Asset, Synthetic Order Book, OOP Design)
 
 This script simulates a simplified limit order book (LOB) environment
-and a market making agent providing liquidity across multiple correlated assets.
+and a market-making agent providing liquidity across multiple 
+correlated assets, using a fully object-oriented design.
 
 Core features:
+  • Abstract base classes for processes and agents
+  • Encapsulation via properties (getters/setters)
+  • Classmethods & staticmethods for object creation/utlities
+  • Magic methods for clean introspection
   • Multi-asset midprice dynamics (OU or GBM)
   • Poisson order arrivals and price impact
   • Dynamic quoting (Avellaneda–Stoikov model)
@@ -14,16 +19,36 @@ Core features:
 
 Created by Thomas Vrije for a quant-research portfolio project.
 """
-
+import abc
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
 
 # ======================================================================
-# 1. Data Structures
+# 1. Abstract Base Classes
+# ======================================================================
+
+class BaseProcess(abc.ABC):
+    """Abstract base class for all stochastic price processes."""
+    @abc.abstractmethod
+    def step(self) -> Dict[str, float]:
+        """Advance the process one step and return updated prices."""
+        pass
+
+
+class BaseAgent(abc.ABC):
+    """Abstract base class for all trading agents."""
+    @abc.abstractmethod
+    def act(self):
+        """Define agent behavior per simulation step."""
+        pass
+
+
+# ======================================================================
+# 2. Core Entities
 # ======================================================================
 
 @dataclass
@@ -31,8 +56,12 @@ class Order:
     """Represents a single limit or market order."""
     price: float
     size: float
-    side: str
-    trader: str = "external" # or "mm" for market maker
+    side: str                  # 'buy' or 'sell'
+    trader: str = "external"   # or "mm" for market maker
+
+    def __repr__(self):
+        """Human-readable summary of order details."""
+        return f"Order({self.side}@{self.price:.2f}, size={self.size:.2f}, {self.trader})"
 
 
 @dataclass
@@ -44,17 +73,19 @@ class Trade:
     seller: str
     timestamp: int
 
+    def __repr__(self):
+        """Human-readable summary of trade details."""
+        return f"Trade(price={self.price:.2f}, size={self.size:.2f})"
 
 
 # ======================================================================
-# 2. Order Book
+# 3. Order Book
 # ======================================================================
 
 class OrderBook:
     """
     Simplified limit order book supporting multiple assets.
 
-    
     Attributes
     ----------
     books: Dict[str, Dict[str, List[Order]]]
@@ -70,38 +101,76 @@ class OrderBook:
         Insert order into the correct book side.
     
     match_orders(symbol: str)
-        Cross best bid/ask; return executed trades.
+        Match best bid/ask; return executed trades.
 
     update_midprice(symbol: str, new_price: float)
         Refresh midprice after simulated price dynamics or trades.
     """
     def __init__(self, symbols: List[str], init_price: float = 100.0):
-        self.symbols = symbols
-        self.books = {s: {"buy": [], "sell": []} for s in symbols}
-        self.mid_prices = {s: init_price for s in symbols}
+        self._symbols = symbols
+        self._books = {s: {"buy": [], "sell": []} for s in symbols}
+        self._mid_prices = {s: init_price for s in symbols}
 
+    # --- Properties ---
+    @property
+    def symbols(self) -> List[str]:
+        """List of asset symbols tracked in this book."""
+        return self._symbols
+    
+    @property
+    def mid_prices(self) -> Dict[str, float]:
+        """Dictionary of current midprices per symbol."""
+        return self._mid_prices
+    
+    @mid_prices.setter
+    def mid_prices(self, value: Dict[str, float]):
+        """Update one or more midprices."""
+        self._mid_prices.update(value)
+
+    # --- Core Methods ---
     def place_order(self, symbol: str, order: Order):
-        """Add an order and maintain sorted order book per side."""
+        """Add an order to the right side and maintain sorted order book per side."""
         pass # TODO
 
     def match_orders(self, symbol: str) -> List[Trade]:
-        """Match top of book orders and update midprice if trades occur."""
+        """Match top of book orders and return executed trades."""
         pass # TODO
 
     def update_midprice(self, symbol: str, new_price: float):
-        """Set or drift the midprice for a symbol."""
-        pass # TODO
+        """Update or drift the midprice for a symbol."""
+        self._mid_prices[symbol] = new_price
+
+    # --- Magic Methods ---
+    def __repr__(self):
+        return f"<Orderbook symbols={self._symbols}>"
+    
+    def __len__(self):
+        """Total number of resting orders across all symbols."""
+        return sum(len(v['buy']) + len(v['sell']) for v in self._books.values())
 
 
 # ======================================================================
-# 3. Market Dynamics
+# 4. Price Process
 # ======================================================================
 
-class PriceProcess:
+class PriceProcess(BaseProcess):
     """
     Simulates midprice evolution for each asset.
 
     Supports correlated OU (mean-reverting) or GBM (diffusive) processes.
+
+    Attributes
+    ----------
+    symbols : List[str]
+        Tracked asset identifiers.
+    dt : float
+        Simulation timestep (fraction of a trading day).
+    model : str
+        Type of stochastic process ('OU' or 'GBM').
+    prices: np.ndarray
+        Current midprice vector.
+    cov : np.ndarray
+        Covariance matrix defining inter-asset correlations.
 
     Methods
     -------
@@ -110,51 +179,88 @@ class PriceProcess:
     """
 
     def __init__(self, symbols: List[str], dt: float = 1/390, model: str = "OU"):
-        self.symbols = symbols
-        self.model = model
-        self.dt = dt
-        self.prices = np.ones(len(symbols)) * 100.0
-        self.cov = np.eye(len(symbols)) * 0.0001 # correlation matrix placeholder
+        self._symbols = symbols
+        self._model = model
+        self._dt = dt
+        self._prices = np.ones(len(symbols)) * 100.0
+        self._cov = np.eye(len(symbols)) * 0.0001 # correlation matrix placeholder
+
+    @property
+    def prices(self) -> Dict[str, float]:
+        """Current midprice dictionary."""
+        return dict(zip(self._symbols, self._prices))
+
+    @staticmethod
+    def _random_noise(n: int, cov: np.ndarray) -> np.ndarray:
+        """Generate correlated Gaussian noise of dimension n."""
 
     def step(self) -> Dict[str, float]:
         """Simulate one step of correlated price movement"""
         pass # TODO
 
+    def __repr__(self):
+        return f"<PriceProcess model={self._model} symbols={self._symbols}>"
+
 
 # ======================================================================
-# 4. Market Maker Agent
+# 5. Market Maker Agent
 # ======================================================================
 
-class MarketMaker:
+class MarketMaker(BaseAgent):
     """
     Liquidity provider quoting bid/ask prices around mid.
 
     Attributes
     ----------
-    inventory: Dict[str, float]
-    cash: float
-    spread: float
-    size: float
+    symbols : List[str]
+        Assets the market maker trades.
+    inventory : Dict[str, float]
+        Current position per asset.
+    cash : float
+        Account cash balance.
+    spread : float
+        Quoted bid-ask spread in price units.
+    size : float
+        Order size per quote.
 
     Methods
     -------
-    quote(symbol, mid_price)
+    quote(symbol, mid)
         Generate bid/ask quotes for a symbol.
 
     update_inventory(trades)
         Adjust inventory and cash based on executed trades.
 
     adapt_spread(volatility, inventory)
-        Optional: dynamic spread control (Avellaneda-Stoikov).
+        Dynamically adjust spread based on volatility and inventory risk.
+    
+    act()
+        Placeholder required by BaseAgent.
     """
 
     def __init__(self, symbols: List[str], spread: float = 0.1, size: float = 10.0):
         self.symbols = symbols
         self.spread = spread
         self.size = size
-        self.inventory = {s: 0.0 for s in symbols}
-        self.cash = 0.0
+        self._inventory = {s: 0.0 for s in symbols}
+        self._cash = 0.0
 
+    # --- Properties ---
+    @property
+    def cash(self) -> float:
+        """Current cash balance."""
+        return self._cash
+    
+    @cash.setter
+    def cash(self, value: float):
+        self._cash = value
+
+    @property
+    def net_worth(self) -> float:
+        """Mark-to-market total wealth (cash + inventory value placeholder)."""
+        return self._cash + sum(self._inventory.values())
+
+    # --- Methods ---
     def quote(self, symbol: str, mid: float) -> Tuple[Order, Order]:
         """Return a bid and ask Order around the current midprice."""
         pass # TODO
@@ -164,12 +270,23 @@ class MarketMaker:
         pass # TODO
 
     def adapt_spread(self, volatility: float, inventory: float):
-        """Optional: risk-based spread adjustment."""
+        """Risk-based spread adjustment (Avellaneda-Stoikov style placeholder)."""
         pass # TODO
 
+    def act(self):
+        """Satisfy BaseAgent abstract method."""
+        pass
+
+    def __repr__(self):
+        return f"<MarketMaker spread={self.spread} size={self.size}>"
+    
+    def __len__(self):
+        """Number of symbols handled by the market maker."""
+        return len(self.symbols)
+    
 
 # ======================================================================
-# 5. Simulation Engine
+# 6. Simulation Engine
 # ======================================================================  
 
 class MarketSimulation:
@@ -177,14 +294,17 @@ class MarketSimulation:
     Orchestrates the entire market simulation.
 
     Components:
-        - PriceProcess(midprice evolution)
-        - OrderBook (matching)
-        - MarketMaker (liquidity provision)
-        - External order flow
+        - PriceProcess : models underlying price dynamics.
+        - OrderBook : maintains order flow and trade execution.
+        - MarketMaker : provides continuous liquidity.
+        - External Orders: randomly generated to simulate real flow.
 
     Methods
     -------
-    run(steps)
+    from_config(config)
+        Factory method to construct a simulation from config dict.
+
+    run()
         Run simulation for N steps; collect stats.
     
     generate_external_orders()
@@ -192,6 +312,9 @@ class MarketSimulation:
     
     compute_pnl()
         Calculate cumulative PnL and performance metrics.
+
+    plot_results(df)
+        Static utility for plotting results.
     """
 
     def __init__(self, symbols: List[str], steps: int = 1000, seed: int = 42):
@@ -200,33 +323,77 @@ class MarketSimulation:
         self.steps = steps
         self.order_book = OrderBook(symbols)
         self.price_process = PriceProcess(symbols)
-        self.mm = MarketMaker(symbols)
-        self.trades_log: List[Trade] = []
+        self.market_maker = MarketMaker(symbols)
+        self.trades: List[Trade] = []
         self.pnl_history: List[float] = []
 
+    # --- Classmethod ---
+    @classmethod
+    def from_config(cls, config: Dict):
+        """Factory constructor from configuration dict."""
+        return cls(**config)
+    
+    # --- Core loop ---
     def generate_external_orders(self) -> List[Tuple[str, Order]]:
-        """Simulate random external orders for all symbols."""
+        """
+        Generate synthetic external market orders.
+
+        Returns
+        -------
+        List[Tuple[str, Order]]
+            A list of (symbol, Order) tuples to insert into the order book.
+        """
         pass # TODO
 
     def run(self):
-        """Run full market simulation loop."""
+        """
+        Main simulation loop:
+            - Advance price process
+            - Generate external and MM orders
+            - Match trades and record results
+        """
         pass # TODO
 
-    def compute_pnl(self):
-        """Compute mark-to-market PnL and related stats."""
+    # --- Metrics ---
+    def compute_pnl(self) -> pd.DataFrame:
+        """
+        Compute mark-to-market PnL and related stats per symbol.
+
+        Returns
+        -------
+        pd.DataFrame
+            Contains columns for time, inventory, cash, and total PnL.
+        """
         pass # TODO
 
-    def plot_results(self):
-        """Visualize price_paths, inventory, and PnL."""
+    # --- Plotting ---
+    @staticmethod
+    def plot_results(df: pd.DataFrame):
+        """
+        Plot midprice trajectories, inventory evolution, and PnL curves.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame returned by compute_pnl().
+        """
         pass # TODO
+
+    def __repr__(self):
+        return f"<MarketSimulation n_steps={self.steps} n_symbols={len(self.symbols)}>"
+    
+    def __iter__(self):
+        """Iterate over all traded symbols."""
+        for s in self.symbols:
+            yield s
 
 
 # ======================================================================
-# 6. Demo Entry Point
+# 7. Demo Entry Point
 # ====================================================================== 
 
 if __name__ == "__main__":
-    symbols = ["SPY", "QQQ", "DIA"]
-    sim = MarketSimulation(symbols=symbols, steps=1000)
+    config = {"symbols": ["SPY", "QQQ", "DIA"], "steps": 1000}
+    sim = MarketSimulation.from_config(config)
     sim.run()
     sim.plot_results()
