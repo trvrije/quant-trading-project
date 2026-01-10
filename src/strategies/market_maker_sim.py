@@ -59,7 +59,7 @@ class SimulationConfig:
             {
                 "spread": 0.1,
                 "size": 10.0,
-                "risk_aversion": 0.1,
+                "risk_aversion": 0.05,
                 "vol_sensitivity": 5.0,
                 "initial_cash": 1000000.0,
                 "inventory_limit": 100.0,
@@ -78,7 +78,9 @@ class SimulationConfig:
                 "taker_unwind_stale_mult": 2.0
                 "adverse_mm_ticks": 0.5,
                 "cancel_slip_ticks": 0.5,
-                "overnight_penalty_bps": 0.0
+                "overnight_penalty_bps": 0.0,
+                "inventory_skew_gamma": 0.002,
+                "quote_update_cost_ps": 0.00005,
             }
     process_params : Dict
         Parameters for the PriceProcess controlling price dynamics, e.g.:
@@ -95,6 +97,7 @@ class SimulationConfig:
                 # Cross-asset correlation
                 "cov_scale": 1.0,
                 "correlation": 0.7,
+                # The rest
                 "impact_eta": 0.0,        # ticks per (trade_size / mm_size)
                 "impact_decay": 0.0,        # 0-1 optional decay towards process anchor
                 "mm_latency_prob": 0.15,
@@ -102,6 +105,15 @@ class SimulationConfig:
                 "mm_refresh_interval": 50,
                 "mm_refresh_ticks": 1,
                 "markout_steps": 0,
+                "maker_markout_ticks": 0.8,
+                "bg_liquidity": True,
+                "bg_inside_ticks": 1,
+                "bg_levels": 3,
+                "bg_size": 400.0,
+                "bg_depth_decay": 0.7,
+                "maker_drag_decay": 0.85,
+                "maker_drag_stepcap": 1.5,
+                "impact_max_ticks_per_step": 3.0,
                 "max_anchor_move_ticks": 3.0,
                 "annual_mu": 0.085,
                 "regime_on": True,
@@ -203,7 +215,7 @@ class SimulationConfig:
     mm_params: Dict = field(default_factory=lambda: {
         "spread": 0.1, 
         "size": 10.0,
-        "risk_aversion": 0.1,
+        "risk_aversion": 0.05,
         "vol_sensitivity": 5.0,
         "initial_cash": 1000000.0,
         "inventory_limit": 100.0,
@@ -223,6 +235,8 @@ class SimulationConfig:
         "adverse_mm_ticks": 0.5,              # shift against MM (in ticks) after maker fill
         "cancel_slip_ticks": 0.5,             # extra adverse ticks if stale when hit
         "overnight_penalty_bps": 0.0,         # charge on EOD |inventory| notional
+        "inventory_skew_gamma": 0.002,
+        "quote_update_cost_ps": 0.00005,
     })
 
     process_params: Dict = field(default_factory= lambda: {
@@ -246,6 +260,15 @@ class SimulationConfig:
         "mm_refresh_interval": 50,
         "mm_refresh_ticks": 1,
         "markout_steps": 0,
+        "maker_markout_ticks": 0.8,
+        "bg_liquidity": True,
+        "bg_inside_ticks": 1,
+        "bg_levels": 3,
+        "bg_size": 400.0,
+        "bg_depth_decay": 0.7,
+        "maker_drag_decay": 0.85,
+        "maker_drag_stepcap": 1.5,
+        "impact_max_ticks_per_step": 3.0,
         "max_anchor_move_ticks": 3.0,
         "annual_mu": 0.085,
         "regime_on": True,
@@ -418,7 +441,7 @@ class Order:
     size: float
     side: Literal["buy", "sell"]
     trader: str = "external"  
-    timestamp: float = field(default_factory=time.time)
+    timestamp: float = 0.0
     _tick_size: float = 0.01 # internal default, overriden via config
 
     def __post_init__(self):
@@ -447,12 +470,14 @@ class Order:
 
     @classmethod
     def from_config(cls, symbol: str, price: float, size: float,
-                    side: str, trader: str, config: SimulationConfig):
+                    side: str, trader: str, config: SimulationConfig,
+                    timestamp: Optional[float] = None):
         """Factory to create an order aligned with simulation config."""
         return cls(symbol=symbol,
                    price=cls.snap(price, config.tick_size, side),
                    size=size, side=side, trader=trader,
-                   _tick_size=config.tick_size)
+                   _tick_size=config.tick_size,
+                   timestamp=(time.time() if timestamp is None else float(timestamp)))
     
 
     @property
@@ -589,6 +614,8 @@ class OrderBook:
         self._symbols = config.symbols
         self._tick_size = config.tick_size
         self._max_depth = config.process_params.get("max_depth", 100)
+        self._mm_queue_share = float(getattr(config.mm_params, "get", lambda k, d=None: d)("mm_queue_share", 0.35)) \
+                               if isinstance(config.mm_params, dict) else 0.35
         
         self._books: Dict[str, Dict[str, List[Order]]] = {
             s: {"buy": [], "sell": []} for s in self._symbols
@@ -715,18 +742,45 @@ class OrderBook:
         opp = "sell" if side == "buy" else "buy"
         fills = []
         while size > 1e-9 and self._books[symbol][opp]:
-            lvl = self._books[symbol][opp][0]
-            bid_px, ask_px = self.top_of_book(symbol)
-            qty = min(size, lvl.size); px = lvl.price
-            buyer = trader if side == "buy" else lvl.trader
-            seller = lvl.trader if side == "buy" else trader
-            t = Trade.from_config(symbol, px, qty, buyer, seller, "taker", self.config)
-            t.maker = lvl.trader; t.aggressor = trader; t.aggressor_side = side
-            t.resting_side = opp
-            t.bid_px = bid_px
-            t.ask_px = ask_px
-            fills.append(t); lvl.size -= qty; size -= qty
-            if lvl.size <= 1e-9: self._books[symbol][opp].pop(0)
+            best_px = self._books[symbol][opp][0].price
+            level = [o for o in self._books[symbol][opp] if abs(o.price - best_px) < 1e-12]
+            others = [o for o in level if o.trader != "mm"]
+            mms    = [o for o in level if o.trader == "mm"]
+
+            sum_oth = sum(o.size for o in others)
+            sum_mm  = sum(o.size for o in mms)
+            if sum_oth + sum_mm <= 1e-12:
+                # clean empty
+                for o in level: self._books[symbol][opp].remove(o)
+                continue
+
+        # target split
+            tgt_mm  = min(size * self._mm_queue_share, sum_mm)
+            tgt_oth = min(size - tgt_mm,              sum_oth)
+
+            def _pro_rata(tgt, bucket):
+                left = tgt
+                for o in bucket:
+                    if left <= 1e-9: break
+                    take = min(left, o.size)
+                    px   = o.price
+                    bid_px, ask_px = self.top_of_book(symbol)
+                    buyer = trader if side == "buy" else o.trader
+                    seller= o.trader if side == "buy" else trader
+                    t = Trade.from_config(symbol, px, take, buyer, seller, "taker", self.config)
+                    t.maker = o.trader; t.aggressor = trader; t.aggressor_side = side
+                    t.resting_side = opp; t.bid_px = bid_px; t.ask_px = ask_px
+                    fills.append(t)
+                    o.size -= take; left -= take
+
+            _pro_rata(tgt_oth, others)
+            _pro_rata(tgt_mm,  mms)
+            size -= (tgt_oth + tgt_mm)
+
+            # remove depleted orders
+            for o in level:
+                if o.size <= 1e-9: self._books[symbol][opp].remove(o)
+            # if still size left at same price, loop continues; if not, next price level will be taken automatically
         return fills
 
 
@@ -737,12 +791,12 @@ class OrderBook:
         self._mid_prices[symbol] = float(new_price)
 
 
-    def top_of_book(self, symbol: str) -> Tuple[float, float]:
-        buys = self._books[symbol]["buy"]
-        sells = self._books[symbol]["sell"]
+    def top_of_book(self, symbol: str, exclude_trader: Optional[str] = None) -> Tuple[float, float]:
+        buys = [o for o in self._books[symbol]["buy"] if exclude_trader is None or o.trader != exclude_trader]
+        sells = [o for o in self._books[symbol]["sell"] if exclude_trader is None or o.trader != exclude_trader]
         mid = self._mid_prices[symbol]
-        best_bid = buys[0].price if buys else max(self._tick_size, mid - self._tick_size)
-        best_ask = sells[0].price if sells else (mid + self._tick_size)
+        best_bid = max((o.price for o in buys), default = max(self._tick_size, mid - self._tick_size))
+        best_ask = min((o.price for o in sells), default = (mid + self._tick_size))
         return best_bid, best_ask
     
 
@@ -812,9 +866,9 @@ class PriceProcess(BaseProcess):
         self._sigma = np.full(n, self._params.get("sigma", 0.02)) 
 
         # covariance and correlation scaling
-        cov_scale = self._params.get("cov_scale", 1)
+        self._cov_scale = self._params.get("cov_scale", 1)
         corr = self._params.get("correlation", 0.7)
-        self._cov = self._build_cov_matrix(n, corr)
+        self._cov = self._build_cov_matrix(n, self._params.get("correlation", 0.7))
 
         # innovations + GARCH`
         self._steps_per_day = max(1, int(round(1.0 / self._dt)))
@@ -893,7 +947,7 @@ class PriceProcess(BaseProcess):
             Updated midprices for all symbols.
         """
         n = len(self._symbols)
-        z = self._random_noise(n, self._cov, self._innov, self._df)
+        z = self._random_noise(n, self._cov, self._innov, self._df) * math.sqrt(self._cov_scale)
 
         if self._regime_on:
             R = self._regimes[self._reg_keys[self._reg_idx]]
@@ -1074,6 +1128,8 @@ class MarketMaker(BaseAgent):
         self._level_step_ticks = mm_cfg.get("level_step_ticks", 1)
         self._depth_decay = mm_cfg.get("depth_decay", 0.6)
         self._risk_horizon_T = mm_cfg.get("risk_horizon_secs", 600) / 23400   # 10 min default
+        self._skew_gamma = float(mm_cfg.get("inventory_skew_gamma",
+                                            mm_cfg.get("risk_aversion", 0.1)))
 
         # state
         self._inventory = {s: 0.0 for s in self.symbols}
@@ -1117,7 +1173,9 @@ class MarketMaker(BaseAgent):
         adjusted_spread = self.adapt_spread(volatility, inv)
         half = adjusted_spread / 2
         tau = self._risk_horizon_T
-        skew = self._gamma * (inv / lim) * (volatility ** 2) * tau
+        sigma_ticks = max(1e-12, (volatility * mid) / self._tick_size)
+        skew_ticks = self._skew_gamma * (inv / lim) * (sigma_ticks ** 2) * tau
+        skew = skew_ticks * self._tick_size
 
         scaled = self._order_size * max(0.0, 1.0 - inv_abs**2)
 
@@ -1156,9 +1214,10 @@ class MarketMaker(BaseAgent):
         maker_ps = float(ps.get("maker", 0.0))
         routing_ps = float(ps.get("routing", 0.0))
         clearing_ps = float(ps.get("clearing", 0.0))
-        per_share_net = (maker_ps if is_maker else -taker_ps) - routing_ps - clearing_ps
+        per_share_net = -(maker_ps if is_maker else taker_ps) - routing_ps - clearing_ps
 
-        sec_sell = float(getattr(self.config, "sec_fee_bps_sell", 0.0)) * notional if side == "sell" else 0.0
+        sec_bps = float(getattr(self.config, "sec_fee_bps_sell", 0.0))
+        sec_sell = (sec_bps / 1e4) * notional if side == "sell" else 0.0
 
         return rebate - taker - route - sec_sell + per_share_net * max(0.0, float(size))
 
@@ -1212,11 +1271,11 @@ class MarketMaker(BaseAgent):
         base = max(2 * self._tick_size, self._base_spread)
         raw = base * (
             1.0
-            + 0.5 * max(0.0, self._gamma)
+            + 0.1 * max(0.0, self._gamma)
             + self._vol_sensitivity * float(volatility)
-            + 2.5 * (inv_abs ** 1.5)
+            + 2.0 * (inv_abs ** 1.5)
         )
-        return float(np.clip(raw, 2 * self._tick_size, 50 * self._tick_size))
+        return float(np.clip(raw, 2 * self._tick_size, 6 * self._tick_size))
 
 
     def quote_ladder(self, symbol: str, mid: float, volatility: float=0.02):
@@ -1225,7 +1284,9 @@ class MarketMaker(BaseAgent):
         spread = self.adapt_spread(volatility, inv)
         half = spread / 2
         tau = self._risk_horizon_T
-        skew = self._gamma * (inv / lim) * (volatility ** 2) * tau
+        sigma_ticks = max(1e-12, (volatility * mid) / self._tick_size)
+        skew_ticks = self._skew_gamma * (inv / lim) * (sigma_ticks ** 2) * tau
+        skew = skew_ticks * self._tick_size
 
         base_size = self._order_size * max(0.0, 1.0 - inv_abs**2)
         if inv >= 0.999 * lim:
@@ -1334,7 +1395,7 @@ class MarketSimulation:
         self._sym_idx: Dict[str, int] = {s: i for i,s in enumerate(self.symbols)}
 
         flow_cfg = config.external_order_params
-        self.flow_intensity = float(flow_cfg.get("lambda", 70000)) # λ arrivals per step
+        self.flow_intensity = float(flow_cfg.get("lambda", 70000)) # λ arrivals per day
         self.buy_prob_base = float(flow_cfg.get("buy_prob", 0.5))
         self.retail_frac = float(flow_cfg.get("retail_frac", 0.7))
         self.retail_mu = float(flow_cfg.get("retail_mu", 5))
@@ -1384,6 +1445,16 @@ class MarketSimulation:
         self.mm_queue_share = float(self.config.mm_params.get("mm_queue_share", 0.6))
         self.queue_jitter = float(self.config.mm_params.get("queue_jitter", 0.02))
 
+        self._maker_drag = {s: 0.0 for s in self.symbols}
+        self._maker_drag_decay = float(pp.get("maker_drag_decay", 0.85))
+        self._maker_drag_stepcap = float(pp.get("maker_drag_stepcap", 1.5))
+
+        self._bg_on = bool(pp.get("bg_liquidity", True))
+        self._bg_inside_ticks = int(pp.get("bg_inside_ticks", 1))
+        self._bg_levels = int(pp.get("bg_levels", 3))
+        self._bg_size0 = float(pp.get("bg_size", 400.0))
+        self._bg_decay = float(pp.get("bg_depth_decay", 0.7))
+
         self.micro_eta = float(pp.get("micro_trade_impact_eta", pp.get("impact_eta", 0.0)))
         self.flow_impact_on = bool(pp.get("flow_impact_enabled", True))
         self.flow_gamma = float(pp.get("flow_impact_gamma", 0.25))
@@ -1426,6 +1497,10 @@ class MarketSimulation:
         self._diag_window = {"maker": 0.0, "taker": 0.0}
         self._pnl_fee = 0.0
         self._pnl_spread = 0.0
+        self._diag_ex_counts_win = {s: {"buy":0, "sell":0, "mkt_buy":0, "mkt_sell":0, "vol_buy":0, "vol_sell":0} for s in self.symbols}
+        self._win_maker_edge_sum = 0.0
+        self._win_maker_edge_n = 0
+        self._cum_abs_inv_notional = 0.0
 
         cov = getattr(self.price_process, "_cov", None)
         if isinstance(cov, np.ndarray) and cov.shape[0] == len(self.symbols):
@@ -1459,12 +1534,27 @@ class MarketSimulation:
         return 1.0 / (1.0 + math.exp(-x))
 
 
+    def _quote_background_orders(self):
+        if not self._bg_on: return
+        step_px = self.config.tick_size
+        for s in self.symbols:
+            self.order_book.cancel_trader(s, "bg")
+            mid = self.order_book.mid_prices[s]
+            for k in range(self._bg_levels):
+                off = (self._bg_inside_ticks + k) * step_px
+                sz = self._bg_size0 * (self._bg_decay ** k)
+                self.order_book.place_order(s, Order.from_config(s, mid - off, sz, "buy", "bg", self.config))
+                self.order_book.place_order(s, Order.from_config(s, mid + off, sz, "sell", "bg", self.config))
+
+
     def _inventory_value_conservative(self) -> float:
         v = 0.0
         for s in self.symbols:
-            bid, ask = self.order_book.top_of_book(s)
+            bid_ex, ask_ex = self.order_book.top_of_book(s, exclude_trader="mm")
+            spr = max(self.tick, ask_ex - bid_ex)
+            hair = max(2.0 * self.tick, 0.5 * spr + self.tick)
             q = self.market_maker.inventory[s]
-            v += q * (bid if q >= 0 else ask)
+            v += q * ((bid_ex - hair) if q >= 0 else (ask_ex + hair))
         return float(v)
     
 
@@ -1501,12 +1591,8 @@ class MarketSimulation:
     
 
     def _reset_step_diag(self):
-        for s in self.symbols:
-            self._diag_ex_counts[s].update({"buy":0, "sell":0, "mkt_buy":0, "mkt_sell":0, "vol_buy":0.0, "vol_sell":0.0})
         self._diag_mm_maker_notional = 0.0
         self._diag_mm_taker_notional = 0.0
-        self._diag_maker_edge_sum = 0.0
-        self._diag_maker_edge_n = 0
         self._step_micro_delta = {s: 0.0 for s in self.symbols}
         self._step_flow_delta = {s: 0.0 for s in self.symbols}
 
@@ -1519,23 +1605,21 @@ class MarketSimulation:
         spds = " ".join(f"{s}:{self._diag_last_spread[s]/self.tick:.1f}t" for s in self.symbols)
         fimp = " ".join(f"{s}:{self._diag_last_flow_delta[s]/self.tick:.2f}t" for s in self.symbols)
         lamb = " ".join(f"{s}:{lb:.2f}/{ls:.2f}" for s,(lb,ls) in self._diag_last_lambda.items())
+        
+        maker_edge_t = (self._win_maker_edge_sum / self._win_maker_edge_n) if self._win_maker_edge_n else 0.0
         exln = " ".join(
             f"{s}:B{c['buy']}({c['mkt_buy']})/S{c['sell']}({c['mkt_sell']})"
-            for s,c in self._diag_ex_counts.items()
+            for s,c in self._diag_ex_counts_win.items()
         )
         
-        maker_edge = (self._diag_maker_edge_sum / self._diag_maker_edge_n) if self._diag_maker_edge_n else 0.0
-        print(f"  mids  | {mids}")
-        print(f"  inv   | {invs}")
-        print(f"  spread| {spds}   flowΔ | {fimp}")
-        print(f"  λ(b/s)| {lamb}")
-        print(
-            f"  ex    | {exln}   fills$ maker/taker: "
-            f"{int(self._diag_window['maker'])}/{int(self._diag_window['taker'])}  "
-            f"maker_edge:{maker_edge:.4f}"
-        )
-        print(f"  feesPnL:{self._pnl_fee:,.0f}  spreadPnL:{self._pnl_spread:,.0f}")
+        print(f"step {step:>6d} | mids {mids} | inv {invs} | spr {spds} | flowΔ {fimp} | λ {lamb}")
+        print(f"        | fills {exln} | maker/taker ${int(self._diag_window['maker'])}/{int(self._diag_window['taker'])} | maker_edge:{maker_edge_t:.2f} ticks")
+
+        # reset window
         self._diag_window = {"maker": 0.0, "taker": 0.0}
+        self._diag_ex_counts_win = {s: {"buy":0,"sell":0,"mkt_buy":0,"mkt_sell":0,"vol_buy":0.0,"vol_sell":0.0} for s in self.symbols}
+        self._win_maker_edge_sum = 0.0
+        self._win_maker_edge_n = 0
 
 
     def _update_rolling_max(self) -> None:
@@ -1601,7 +1685,7 @@ class MarketSimulation:
         return fills
 
 
-    def generate_external_orders(self) -> List[Tuple[str, Order]]:
+    def generate_external_orders(self, step: int) -> List[Tuple[str, Order]]:
         orders: List[Tuple[str, Order]] = []
 
         for s in self.symbols:
@@ -1641,7 +1725,7 @@ class MarketSimulation:
             lam_sell = min(max(lam_sell, 0.0), cap)
 
             self._diag_last_lambda[s] = (lam_buy, lam_sell)
-            cnt = self._diag_ex_counts[s]
+            cnt = self._diag_ex_counts_win[s]
 
             n_buy = np.random.poisson(lam_buy)
             n_sell = np.random.poisson(lam_sell)
@@ -1687,8 +1771,8 @@ class MarketSimulation:
                         price = max(best_bid + self.tick, mid * (1 + off))
                     price = max(self.tick, price)
 
-
-                orders.append((s, Order.from_config(s, price, size, side, "external", self.config)))
+                ts = step + np.random.uniform(-0.5, 0.5)
+                orders.append((s, Order.from_config(s, price, size, side, "external", self.config, timestamp=ts)))
 
             for _ in range(n_buy):
                 _mk("buy")
@@ -1701,7 +1785,7 @@ class MarketSimulation:
     def _apply_trade_impact(self, step_trades: List[Trade]) -> None:
         if self.micro_eta <= 0 or not step_trades:
             return
-        max_ticks_per_step = 2.0
+        max_ticks_per_step = float(self.config.process_params.get("impact_max_ticks_per_step", 3.0))
 
         for t in step_trades:
             side = getattr(t, "aggressor_side", None)
@@ -1718,13 +1802,27 @@ class MarketSimulation:
             if getattr(t, "maker", "") == "mm":
                 boost *= (1.0 + self.maker_adverse_eta)
 
-            raw = direction * self.micro_eta * scale * self.config.dt * boost
+            raw = direction * self.micro_eta * scale * boost
             delta = np.sign(raw) * min(abs(raw), max_ticks_per_step - abs(self._step_micro_delta[t.symbol]))
             if abs(delta) <= 0.0:
                 continue
             self._step_micro_delta[t.symbol] += delta
             mid = self.order_book.mid_prices[t.symbol]
             self.order_book.update_midprice(t.symbol, max(self.tick, mid + float(delta) * self.tick))
+
+            adverse_ticks = float(self.config.mm_params.get("adverse_mm_ticks", 0.5))
+            cancel_ticks = float(self.config.mm_params.get("cancel_slip_ticks", 0.25))
+            if getattr(t, "maker", "") == "mm":
+                dir_sign = +1.0 if getattr(t, "resting_side", None) == "sell" else -1.0
+                extra = dir_sign * (adverse_ticks + (cancel_ticks if getattr(t, "stale", False) else 0.0))
+
+                room = max(0.0, max_ticks_per_step - abs(self._step_micro_delta[t.symbol]))
+                inc = float(np.sign(extra) * min(abs(extra), room))
+                if inc:
+                    self._step_micro_delta[t.symbol] += inc
+                    mid = self.order_book.mid_prices[t.symbol]
+                    self.order_book.update_midprice(t.symbol, max(self.tick, mid + inc * self.tick))
+
 
 
     def _apply_flow_impact(self, step_trades: List[Trade]) -> None:
@@ -1764,7 +1862,7 @@ class MarketSimulation:
 
         # apply in ticks
         mix = np.clip(mix, -5.0, 5.0)
-        max_ticks_per_step = 3.0
+        max_ticks_per_step = 1.0
         for s in self.symbols:
             i = self._sym_idx[s]
             mid = self.order_book.mid_prices[s]
@@ -1777,6 +1875,27 @@ class MarketSimulation:
             self._step_flow_delta[s] += inc
             self._diag_last_flow_delta[s] = inc
             self.order_book.update_midprice(s, max(self.tick, mid + inc * self.tick))
+
+
+    def _apply_maker_markout_penalty(self, step_trades: List[Trade]) -> None:
+        ticks_per_clip = float(self.config.process_params.get("maker_markout_ticks", 1.2))
+        base = max(1e-9, getattr(self.market_maker, "_order_size", 1.0))
+        for t in step_trades:
+            if getattr(t, "maker", "") != "mm":
+                continue
+            s = t.symbol
+            sign = +1.0 if t.buyer == "mm" else -1.0
+            self._maker_drag[s] += (-sign) * min(3.0, (t.size / base) * ticks_per_clip)
+
+
+    def _apply_maker_drag(self):
+        for s in self.symbols:
+            d = self._maker_drag[s]
+            if abs(d) > 1e-6:
+                step = np.sign(d) * min(abs(d), self._maker_drag_stepcap)
+                mid = self.order_book.mid_prices[s]
+                self.order_book.update_midprice(s, max(self.tick, mid + step * self.tick))
+            self._maker_drag[s] *= self._maker_drag_decay
 
 
     def _decay_impact(self) -> None:
@@ -1808,8 +1927,6 @@ class MarketSimulation:
             if ap_cost:
                 self.market_maker.cash -= ap_cost
                 self._pnl_fee -= ap_cost
-            for s in self.symbols:
-                self._mid_hist[s].append(self.order_book.mid_prices[s])
 
             # Helpers
             def _quote_mm():
@@ -1845,14 +1962,22 @@ class MarketSimulation:
                         
                         r = np.random.rand()
                         jitter = self.queue_jitter * np.random.rand()
-                        o.timestamp += (-jitter if r < self.mm_queue_share else jitter)
+                        o.timestamp = step + (-jitter if r < self.mm_queue_share else jitter)
                         self.order_book.place_order(sym, o)
-                    
+
+                    q_cost = float(self.config.mm_params.get("quote_update_cost_ps", 0.0))
+                    if q_cost and mm_orders:
+                        cost = q_cost * len(mm_orders)
+                        self.market_maker.cash -= cost
+                        self._pnl_fee -= cost
+
                     self._last_mm_mid[sym] = mid
 
             
+            self._quote_background_orders()
+
             def _push_external():
-                for sym, order in self.generate_external_orders():
+                for sym, order in self.generate_external_orders(step):
                     self.order_book.place_order(sym, order)
 
             
@@ -1893,21 +2018,24 @@ class MarketSimulation:
                 self.trades.extend(step_trades)
                 self.market_maker.update_inventory(step_trades)
                 self._apply_trade_impact(step_trades)
+                self._apply_maker_markout_penalty(step_trades)
             self._apply_flow_impact(step_trades)
+            self._apply_maker_drag()
 
             if step_trades:
                 for t in step_trades:
                     if "mm" not in (t.buyer, t.seller):
                         continue
-
-                    mid_book = (t.bid_px + t.ask_px) / 2 if (t.bid_px is not None and t.ask_px is not None) else self.order_book.mid_prices[t.symbol]
+                    
+                    bid_ex, ask_ex = self.order_book.top_of_book(t.symbol, exclude_trader = "mm")
+                    mid_book = (bid_ex + ask_ex) / 2.0
                     
                     if t.maker == "mm":
                         self._diag_mm_maker_notional += t.notional
                         edge0 = (t.price - mid_book) if t.seller == "mm" else (mid_book - t.price)
                         self._pnl_spread += edge0 * t.size
-                        self._diag_maker_edge_sum += float(edge0)
-                        self._diag_maker_edge_n += 1
+                        self._win_maker_edge_sum += (edge0 / self.tick)
+                        self._win_maker_edge_n += 1
                     else:
                         self._diag_mm_taker_notional += t.notional
 
@@ -1919,6 +2047,13 @@ class MarketSimulation:
                         routed=True
                     )
                     self._pnl_fee += fee_effect
+
+            steps_per_day = max(1, int(round(1.0 / self.config.dt)))
+            if (step + 1) % steps_per_day == 0:
+                pen = float(self.config.mm_params.get("overnight_penalty_bps", 0.0)) * 1e-4
+                eod_notional = sum(abs(self.market_maker.inventory[s]) * self._mark_price(s) for s in self.symbols)
+                self.market_maker.cash -= pen * eod_notional
+                self._pnl_fee -= pen * eod_notional
 
             self._decay_impact()
             for sym in self.symbols:
@@ -1938,6 +2073,9 @@ class MarketSimulation:
             inv_val_mid = sum(self.market_maker.inventory[s] * self._mark_price(s) for s in self.symbols)
             inv_val_cons = self._inventory_value_conservative()
             equity_now = cash_now + inv_val_cons
+            self._cum_abs_inv_notional += sum(
+                abs(self.market_maker.inventory[s]) * self._mark_price(s) for s in self.symbols
+            )
 
             step_change = equity_now - self._prev_equity_cons
             reval_step = step_change - realized_step - fees_step
@@ -1960,6 +2098,8 @@ class MarketSimulation:
             })
 
             self._update_rolling_max() # update ATH with current mids
+            for s in self.symbols:
+                self._mid_hist[s].append(self.order_book.mid_prices[s])
             self._set_prev_mid() # set prev for next step
 
             self._diag_window["maker"] += self._diag_mm_maker_notional
@@ -1988,17 +2128,18 @@ class MarketSimulation:
             raise ValueError("PnL history is empty. Did you run the simulation?")
 
         # --- Core components ---
-        df["equity"] = df["cash"] + df["inventory_value"]
-        df["step_pnl"] = df["equity"].diff().fillna(0.0)
+        df["equity_cons"] = df["equity"].astype(float)
+        df["equity_mid"] = df["cash"].astype(float) + df["inventory_value_mid"].astype(float)
+        df["step_pnl"] = df["equity_cons"].diff().fillna(0.0)
         df["realized_cum"] = df["step_realized"].cumsum()
         df["reval_cum"] = df["step_reval"].cumsum()
         df["fees_cum"] = df["step_fees"].cumsum()
-        df["total_pnl"] = df["equity"] - float(df["equity"].iloc[0])
+        df["total_pnl"] = df["equity_cons"] - float(df["equity_cons"].iloc[0])
         
         # Daily aggregation
         steps_per_day = max(1, int(round(1.0 / float(self.config.dt))))
         grp = np.arange(len(df)) // steps_per_day
-        daily_equity = df["equity"].groupby(grp).last().astype(float)
+        daily_equity = df["equity_cons"].groupby(grp).last().astype(float)
         daily_ret = daily_equity.pct_change().dropna().values
 
         rf_annual = float(getattr(self.config, "risk_free_annual", 0.0) or 0.0)
@@ -2013,16 +2154,19 @@ class MarketSimulation:
             sharpe = mu_d / max(sig_d, eps) * math.sqrt(252.0)
 
             dn = ex[ex < 0.0]
-            dn_sigma = float(np.nanstd(dn, ddof=1)) if dn.size >= 1 else 0.0
-            sortino = mu_d / max(dn_sigma, eps) * math.sqrt(252.0)
+            if dn.size == 0:
+                sortino = np.nan
+            else:
+                dn_sigma = float(np.nanstd(dn, ddof=1)) 
+                sortino = mu_d / max(dn_sigma, eps) * math.sqrt(252.0)
         else:
             mu_d = sig_d = sharpe = sortino = np.nan
 
         # --- Risk metrics ---
-        max_dd_abs, max_dd_pct = self._compute_drawdown(df["equity"])
+        max_dd_abs, max_dd_pct = self._compute_drawdown(df["equity_cons"])
         sim_years = (len(df) / steps_per_day) / 252.0
-        if sim_years > 0 and float(df["equity"].iloc[0]) > 0:
-            cagr = (float(df["equity"].iloc[-1]) / float(df["equity"].iloc[0])) ** (1.0 / sim_years) - 1.0 
+        if sim_years > 0 and float(df["equity_cons"].iloc[0]) > 0:
+            cagr = (float(df["equity_cons"].iloc[-1]) / float(df["equity_cons"].iloc[0])) ** (1.0 / sim_years) - 1.0 
         else:
             cagr = np.nan
 
@@ -2031,7 +2175,7 @@ class MarketSimulation:
 
         # --- Summary dictionary ---
         summary = {
-            "Final Equity": float(df["equity"].iloc[-1]),
+            "Final Equity": float(df["equity_cons"].iloc[-1]),
             "Step PnL (mean)": float(df["step_pnl"].mean()),
             "Total PnL": float(df["total_pnl"].iloc[-1]),
             "Realized PnL (cum)": float(df["realized_cum"].iloc[-1]),
@@ -2042,7 +2186,7 @@ class MarketSimulation:
             "Sharpe (ann.)": float(sharpe) if np.isfinite(sharpe) else np.nan,
             "Sortino (ann.)": float(sortino) if np.isfinite(sortino) else np.nan,
             "Max Drawdown (abs)": float(max_dd_abs),
-            "Max Drawdown (%)": float(max_dd_pct),
+            "Max Drawdown (%)": float(max_dd_pct * 100),
             "CAGR (annualized)": float(cagr),
             "Inventory Turnover": float(turnover),
             "Hit Ratio": float(hit_ratio),
@@ -2088,9 +2232,7 @@ class MarketSimulation:
         if not mm_trades:
             return 0.0
         vol_notional = sum(t.notional for t in mm_trades)
-        avg_inv_units = self._cum_abs_inv / max(1, self.steps)
-        avg_mid = np.mean([self.order_book.mid_prices[s] for s in self.symbols])
-        avg_inv_notional = avg_inv_units * avg_mid
+        avg_inv_notional = self._cum_abs_inv_notional / max(1, self.steps)
         return vol_notional / max(1e-9, avg_inv_notional)
 
     
@@ -2100,8 +2242,13 @@ class MarketSimulation:
         if not mm_trades:
             return np.nan
         steps_per_day = max(1, int(round(1.0 / self.config.dt)))
-        steps_per_min = max(1, int(round(steps_per_day / 390)))
-        k = int(self.config.process_params.get("markout_steps", steps_per_min))
+        cfg_k = int(self.config.process_params.get("markout_steps", 0))
+        if cfg_k > 0:
+            k = cfg_k
+        else:
+            steps_per_min = max(1, int(round(steps_per_day / 390)))
+            k = steps_per_min
+ 
         wins = 0; denom = 0
         for t in mm_trades:
             hist = self._mid_hist.get(t.symbol)
@@ -2174,25 +2321,27 @@ if __name__ == "__main__":
             "spread": 0.01,
             "size": 50.0,
             "risk_aversion": 0.05,
-            "vol_sensitivity": 1.0,
+            "vol_sensitivity": 0.35,
             "initial_cash": 5_000_000.0,
             "inventory_limit": 20000.0,
             "inventory_penalty": 2.0,
             "min_unwind_frac": 0.25,
-            "levels": 3,
+            "levels": 5,
             "level_step_ticks": 1,
-            "depth_decay": 0.7,
-            "mm_queue_share": 0.50,
-            "queue_jitter": 0.002,
+            "depth_decay": 0.5,
+            "mm_queue_share": 0.1,
+            "queue_jitter": 0.01,
             "risk_horizon_secs": 300,
             "taker_unwind_enabled": True,
-            "taker_unwind_trigger": 0.3,
-            "taker_unwind_target": 0.15,
-            "taker_unwind_max_clips": 12,
+            "taker_unwind_trigger": 0.85,
+            "taker_unwind_target": 0.55,
+            "taker_unwind_max_clips": 4,
             "taker_unwind_stale_mult": 2.0,
             "adverse_mm_ticks": 0.5,
-            "cancel_slip_ticks": 0.5,
-            "overnight_penalty_bps": 0.0,
+            "cancel_slip_ticks": 0.25,
+            "overnight_penalty_bps": 1.5,
+            "inventory_skew_gamma": 0.002,
+            "quote_update_cost_ps": 0.00010,
         },
 
         "process_params": {
@@ -2206,10 +2355,10 @@ if __name__ == "__main__":
             "correlation": 0.7,
             "cov_scale": 1.0,
             "impact_eta": 0.0,
-            "impact_decay": 0.05,
-            "mm_latency_prob": 0.1,
-            "stale_impact_boost": 1.0,
-            "mm_refresh_interval": 10,
+            "impact_decay": 0.02,
+            "mm_latency_prob": 0.45,
+            "stale_impact_boost": 1.5,
+            "mm_refresh_interval": 60,
             "mm_refresh_ticks": 1,
             "innovations": "student_t",
             "df": 5,
@@ -2220,15 +2369,24 @@ if __name__ == "__main__":
             "jump_lambda": 0.02,
             "jump_mu": 0.0,
             "jump_sigma": 0.02,
-            "micro_trade_impact_eta": 0.01,   
+            "micro_trade_impact_eta": 0.05,   
             "flow_impact_enabled": True,
-            "flow_impact_gamma": 0.005,      
+            "flow_impact_gamma": 0.02,      
             "flow_impact_alpha": 0.6,       
             "flow_impact_beta": 60.0,       
             "flow_cross_rho": 0.3,           
             "flow_include_mm": False,        
             "flow_vol_norm": True,
             "markout_steps": 0,
+            "maker_markout_ticks": 1.2,
+            "bg_liquidity": True,
+            "bg_inside_ticks": 1,
+            "bg_levels": 4,
+            "bg_size": 600.0,
+            "bg_depth_decay": 0.65,
+            "maker_drag_decay": 0.88,
+            "maker_drag_stepcap": 2.0,
+            "impact_max_ticks_per_step": 3.0,
             "max_anchor_move_ticks": 5.0, 
             "annual_mu": 0.085,
             "regime_on": True,
@@ -2253,27 +2411,27 @@ if __name__ == "__main__":
             "buyprob_alpha": 2.0,
             "marketable_alpha": 1.0,
             "hawkes_enabled": True,
-            "hawkes_alpha_self": 0.05,
-            "hawkes_alpha_cross": 0.02,
+            "hawkes_alpha_self": 0.13,
+            "hawkes_alpha_cross": 0.05,
             "hawkes_beta": 50.0,
             "hawkes_cap_mult": 2.0,
-            "trend_eta": 0.3,
-            "vol_eta": 0.7,
-            "mkt_trend_slope": 1.0,
-            "mkt_vol_slope": 2.0,
+            "trend_eta": 0.75,
+            "vol_eta": 0.75,
+            "mkt_trend_slope": 3.0,
+            "mkt_vol_slope": 3.0,
             "size_vol_slope": 1.0,
         },
 
-        "fee_rate": 6e-06,           # taker = 0.06 bps
-        "rebate_rate": 3e-06,        # maker rebate = 0.03 bps
+        "fee_rate": 4e-05,           # taker = 0.4 bps
+        "rebate_rate": 2e-05,        # maker rebate = 0.2 bps
         "routing_fee_rate": 2e-07, # = 0.002 bps (near-zero)
         "verbose": True,
 
         # ETF creation/redemption
         "etf_ap": {
-            "enabled": True,
+            "enabled": False,
             "prem_threshold": 5e-4,        # 5 bps premium/discount trigger
-            "ap_kappa": 10.0,              # tether strength (annualized)
+            "ap_kappa": 5.0,              # tether strength (annualized)
             "ap_cost_bps": 2e-4,          # 2 bps = 0.02% cost on AP notional flow
             "sigma_nav_mult": 0.6,         # NAV smoother than trade price
             "max_ap_flow_per_day": 0.05
@@ -2281,10 +2439,10 @@ if __name__ == "__main__":
 
         # Per-share fees (USD per share, set to 0 if not needed)
         "per_share_fees": {
-            "taker": 0.0030,
-            "maker": 0.0015,
-            "routing": 0.0002,
-            "clearing":0.0001,
+            "taker": 0.0050,
+            "maker": 0.0025,
+            "routing": 0.0003,
+            "clearing":0.0002,
         },
     }
     
