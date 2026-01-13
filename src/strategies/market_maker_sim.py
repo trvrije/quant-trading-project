@@ -830,6 +830,51 @@ class OrderBook:
         return best_bid, best_ask
     
 
+    def depth_and_imbalance(
+            self, symbol: str, levels: int = 1, exclude_trader: Optional[str] = None
+    ) -> Tuple[float, float, float, float, float, float]:
+        """
+        Returns (imbalance[-1..1], best_bid, best_ask, spread_ticks, bid_depth, ask_depth)
+        Depth sums up to 'levels' price levels per side. Optionally exclude a trader.
+        """
+        buys = [o for o in self._books[symbol]["buy"] if (exclude_trader is None or o.trader != exclude_trader)]
+        sells = [o for o in self._books[symbol]["sell"] if (exclude_trader is None or o.trader != exclude_trader)]
+
+        mid = self._mid_prices[symbol]
+        if not buys or not sells:
+            bid, ask = self.top_of_book(symbol, exclude_trader=exclude_trader)
+            spr_ticks = max(self._tick_size, ask - bid) / self._tick_size
+            return 0.0, bid, ask, spr_ticks, 0.0, 0.0
+        
+        buys_sorted = sorted(buys, key=lambda x: (-x.price, x.timestamp))
+        sells_sorted = sorted(sells, key=lambda x: (x.price, x.timestamp))
+
+        def sum_levels(lst, lvls):
+            total = 0.0
+            i = 0
+            levels_used = 0
+            n = len(lst)
+            while i < n and levels_used < lvls:
+                px = lst[i].price
+                level_sz = 0.0
+                while i < n and abs(lst[i].price - px) < 1e-12:
+                    level_sz += lst[i].size
+                    i += 1
+                total += level_sz
+                levels_used += 1
+            return total
+        
+        bid = buys_sorted[0].price if buys_sorted else max(self._tick_size, mid - self._tick_size)
+        ask = sells_sorted[0].price if sells_sorted else (mid + self._tick_size)
+        spr_ticks = max(self._tick_size, ask - bid) / self._tick_size
+
+        bid_depth = sum_levels(buys_sorted, levels)
+        ask_depth = sum_levels(sells_sorted, levels)
+        den = (bid_depth + ask_depth)
+        imb = (bid_depth - ask_depth) / den if den > 1e-12 else 0.0
+        return float(imb), float(bid), float(ask), float(spr_ticks), float(bid_depth), float(ask_depth)
+
+
     def cancel_trader(self, symbol: str, trader: str):
         b = self._books[symbol]
         b["buy"] = [o for o in b["buy"] if o.trader != trader]
@@ -1264,31 +1309,35 @@ class MarketMaker(BaseAgent):
     def _apply_fees(self, *, is_maker: bool, notional: float, size: float, side: Optional[str] = None, routed: bool=True) -> float:
         """
         Net cash impact from fees/rebates for THIS fill.
-        Mix % of notional with per-share fees (config.per_share_fees).
         positive value increases cash, negative decreases cash.
+
         """
-        taker = (self.config.fee_rate * notional) if (not is_maker) else 0.0
-        rebate = (self.config.rebate_rate * notional) if is_maker else 0.0
-        route = (getattr(self.config, "routing_fee_rate", 0.0) * notional) if routed else 0.0
+        taker_bps = self.config.fee_rate * notional if (not is_maker) else 0.0
+        maker_rebate_bps = self.config.rebate_rate * notional if is_maker else 0.0
+        routing_bps = (getattr(self.config, "routing_fee_rate", 0.0) * notional) if routed else 0.0
         
         ps = getattr(self.config, "per_share_fees", {}) or {}
-        taker_ps = float(ps.get("taker", 0.0))
-        maker_ps = float(ps.get("maker", 0.0))
+        taker_fee_ps = float(ps.get("taker", 0.0))
+        maker_fee_ps = float(ps.get("maker", 0.0))
         routing_ps = float(ps.get("routing", 0.0))
         clearing_ps = float(ps.get("clearing", 0.0))
-        finra_ps = float(ps.get("finra_taf_ps", 0.0))
-        finra_cap = float(ps.get("finra_taf_cap", 0.0))
 
-        per_share_core = -(maker_ps if is_maker else taker_ps) - routing_ps - clearing_ps
+        if is_maker:
+            per_share_net = -(maker_fee_ps + routing_ps + clearing_ps)
+        else:
+            per_share_net = -(taker_fee_ps + routing_ps + clearing_ps)
+        core_ps_cash = per_share_net * max(0.0, float(size))
 
+        taf_ps = float(ps.get("finra_taf_ps", 0.0))
+        taf_cap = float(ps.get("finra_taf_cap", 0.0))
         taf = 0.0
         if (side == "sell") and (size > 0):
-            taf = -min(finra_ps * float(size), finra_cap)
+            taf = -min(taf_ps * float(size), taf_cap)
 
         sec_bps = float(getattr(self.config, "sec_fee_bps_sell", 0.0))
         sec_fee = -(sec_bps / 1e4) * notional if side == "sell" else 0.0
 
-        return rebate - taker - route + per_share_core * max(0.0, float(size)) + taf + sec_fee
+        return maker_rebate_bps - taker_bps - routing_bps + core_ps_cash + taf + sec_fee
 
 
     def update_inventory(self, trades: List[Trade]):
@@ -1629,13 +1678,25 @@ class MarketSimulation:
 
 
     def _inventory_value_conservative(self) -> float:
+        """
+        Conservative MTM: long marked to (bid - haircut), short to (ask + haircut).
+        Haircut = 0.5 * exMM spread + 0.5 * tick + VaR(vol, horizon, z=2.33).
+        """
+        z = 2.33
         v = 0.0
+        tau_days = max(1e-6, float(self.market_maker._risk_horizon_T))
         for s in self.symbols:
             bid_ex, ask_ex = self.order_book.top_of_book(s, exclude_trader="mm")
             spr = max(self.tick, ask_ex - bid_ex)
-            hair = max(self.tick, 0.5 * spr + 0.5 * self.tick)
-            q = self.market_maker.inventory[s]
-            v += q * ((bid_ex - hair) if q >= 0 else (ask_ex + hair))
+            base_hair = 0.5 * spr + 0.5 * self.tick
+
+            mid = self.order_book.mid_prices[s]
+            vol_d = max(1e-12, self._cur_daily_vol(s))
+            var_hair = z * mid * vol_d * math.sqrt(tau_days)
+            hair = base_hair + var_hair
+            q = float(self.market_maker.inventory[s])
+            px = (max(self.tick, bid_ex - hair) if q >= 0.0 else (ask_ex + hair))
+            v += q * px
         return float(v)
     
 
@@ -1859,7 +1920,18 @@ class MarketSimulation:
             lam_buy *= trend_mult * vol_mult
             lam_sell *= (1.0 / trend_mult) * vol_mult
 
-            cap = self.h_cap_mult * base_total_sym
+            best_bid, best_ask = self.order_book.top_of_book(s)
+            spr_ticks = max(1.0, (best_ask - best_bid) / self.tick)
+            obi, _, _, _, _, _ = self.order_book.depth_and_imbalance(s, levels=1, exclude_trader=None)
+            intr = float(getattr(self.price_process, "_last_intraday", 1.0))
+            spread_mult = float(np.clip(2.0 / spr_ticks, 0.4, 2.5))
+            imb_slope = 1.0
+            lam_buy *= math.exp(-imb_slope * obi)
+            lam_sell *= math.exp(+imb_slope * obi)
+            lam_buy *= spread_mult * intr
+            lam_sell *= spread_mult * intr
+            cap = self.h_cap_mult * base_total_sym * float(np.clip(spr_ticks / 2.0, 0.5, 3.0))
+
             lam_buy = min(max(lam_buy, 0.0), cap)
             lam_sell = min(max(lam_sell, 0.0), cap)
 
@@ -2489,10 +2561,10 @@ if __name__ == "__main__":
         "tick_size": 0.01,
         
         "mm_params": {
-            "spread": 0.01,
+            "spread": 0.02,
             "size": 200.0,
             "risk_aversion": 0.05,
-            "vol_sensitivity": 0.50,
+            "vol_sensitivity": 2.0,
             "initial_cash": 5_000_000.0,
             "inventory_limit": 20000.0,
             "inventory_penalty": 2.0,
@@ -2527,9 +2599,9 @@ if __name__ == "__main__":
             "correlation": 0.88,
             "cov_scale": 1.0,
             "impact_eta": 0.0,
-            "impact_decay": 0.02,
-            "mm_latency_prob": 0.2,
-            "stale_impact_boost": 2.0,
+            "impact_decay": 0.01,
+            "mm_latency_prob": 0.05,
+            "stale_impact_boost": 1.5,
             "mm_refresh_interval": 10,
             "mm_refresh_ticks": 0.5,
             "innovations": "student_t",
@@ -2538,7 +2610,7 @@ if __name__ == "__main__":
             "garch_omega": 1e-6,
             "garch_alpha": 0.05,
             "garch_beta": 0.92,
-            "jump_lambda": 0.04,
+            "jump_lambda": 0.03,
             "jump_mu": 0.0,
             "jump_sigma": 0.04,
             "intraday_u_shape": True,
@@ -2574,9 +2646,9 @@ if __name__ == "__main__":
             "annual_mu": 0.085,
             "regime_on": True,
             "regimes": {
-                "side": {"mu_ann": 0, "vol_mult": 1.0, "p_stay": 0.98},
-                "bull": {"mu_ann": 0.18, "vol_mult": 0.85, "p_stay": 0.985},
-                "bear": {"mu_ann": -0.25, "vol_mult": 1.60, "p_stay": 0.975}
+                "side": {"mu_ann": 0.03, "vol_mult": 1.0, "p_stay": 0.98},
+                "bull": {"mu_ann": 0.20, "vol_mult": 0.85, "p_stay": 0.985},
+                "bear": {"mu_ann": -0.30, "vol_mult": 2.0, "p_stay": 0.975}
             }          
         },
 
@@ -2584,22 +2656,22 @@ if __name__ == "__main__":
             "lambda": 20000,
             "price_sigma": 0.0005,
             "offset_tick_sigma": 1,
-            "marketable_frac": 0.35,
+            "marketable_frac": 0.45,
             "retail_mu": 5,
-            "inst_mu": 40,
+            "inst_mu": 75,
             "retail_frac": 0.7,
-            "buy_prob": 0.55,
+            "buy_prob": 0.52,
             "use_price_bias": True,
             "bias_mode": "trend",
             "buyprob_alpha": 2.0,
             "marketable_alpha": 1.0,
             "hawkes_enabled": True,
-            "hawkes_alpha_self": 0.13,
+            "hawkes_alpha_self": 0.12,
             "hawkes_alpha_cross": 0.05,
             "hawkes_beta": 50.0,
             "hawkes_cap_mult": 2.0,
-            "trend_eta": 0.9,
-            "vol_eta": 0.9,
+            "trend_eta": 0.8,
+            "vol_eta": 0.8,
             "mkt_trend_slope": 4.0,
             "mkt_vol_slope": 3.0,
             "size_vol_slope": 1.0,
