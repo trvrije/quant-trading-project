@@ -1,21 +1,17 @@
 """
-Market Maker Simulation (Multi-Asset, Synthetic Order Book, OOP Design)
 
-This script simulates a simplified limit order book (LOB) environment
-and a market-making agent providing liquidity across multiple 
-correlated assets, using a fully object-oriented design.
+Market Maker Simulation — Multi-Asset Synthetic LOB (OOP)
 
-Core features:
-  • Abstract base classes for processes and agents
-  • Encapsulation via properties (getters/setters)
-  • Classmethods & staticmethods for object creation/utlities
-  • Magic methods for clean introspection
-  • Multi-asset midprice dynamics (OU or GBM)
-  • Poisson order arrivals and price impact
-  • Dynamic quoting (Avellaneda–Stoikov model)
-  • Inventory and risk control
-  • PnL tracking and performance metrics
-  • Visualization utilities for prices, inventory, and PnL
+Simulates a simplified multi-asset limit order book with a configurable
+liquidity-providing agent. Prices evolve under correlated OU or GBM
+dynamics with optional GARCH, jumps, intraday U-shape, event spikes,
+and flow/impact feedback. External order flow uses Poisson/Hawkes
+arrivals with trend/volatility tilts. The market maker quotes a ladder
+(Avellaneda–Stoikov style adjustments), manages inventory, and tracks
+PnL with conservative marking, fees/rebates, and diagnostics.
+
+Main components: SimulationConfig, Order/Trade, OrderBook, PriceProcess,
+MarketMaker, and MarketSimulation orchestrator.
 
 Created by Thomas Vrije for a quant-research portfolio project.
 """
@@ -35,190 +31,45 @@ import math
 @dataclass
 class SimulationConfig:
     """
-    Global configuration object controlling every component of the market simulation.
-    Each field has sensible defaults but can be overridden at runtime to run 
-    experiments under different assumptions or regimes.
+    Global simulation settings shared by all components.
 
     Attributes
     ----------
-    symbols : List[str]
-        List of asset tickers to simulate.
+    symbols : list[str]
+        Asset tickers to simulate.
     steps : int
-        Number of discrete time steps in the simulation.
+        Number of discrete time steps.
     dt : float
-        Time resolution per step (e.g., 1/390 for 1-minute data, 1/23400 for 1-second).
-    model : str
-        Price process model, either 'OU' (mean-reverting) or 'GBM' (diffusive).
+        Fraction of a trading day per step (e.g., 1/390 for 1-minute, 1/23400 for seconds).
+    model : {"OU","GBM"}
+        Price process family.
     seed : int
-        Random seed for reproducibility of stochastic components.
+        RNG seed.
     tick_size : float
-        Minimum allowed price increment (used for rounding and matching).
-    sec_fee_bps_sell = 0.0
-    mm_params : Dict
-        Parameters passed to the MarketMaker agent, e.g.:
-            {
-                "spread": 0.1,
-                "size": 10.0,
-                "risk_aversion": 0.05,
-                "vol_sensitivity": 5.0,
-                "initial_cash": 1000000.0,
-                "inventory_limit": 100.0,
-                "inventory_penalty": 1.0,
-                "min_unwind_frac": 0.10,
-                "levels": 3,
-                "level_step_ticks": 1,
-                "depth_decay": 0.6,
-                "mm_queue_share": 0.6,
-                "queue_jitter": 0.02,
-                "risk_horizon_secs": 600,
-                "taker_unwind_enabled": True,
-                "taker_unwind_trigger": 0.6,
-                "taker_unwind_target": 0.4,
-                "taker_unwind_max_clips": 10,
-                "taker_unwind_stale_mult": 2.0
-                "adverse_mm_ticks": 0.5,
-                "cancel_slip_ticks": 0.5,
-                "overnight_penalty_bps": 0.0,
-                "inventory_skew_gamma": 0.002,
-                "quote_update_cost_ps": 0.00005,
-                "ioc_cooldown_steps": 20,
-            }
-    process_params : Dict
-        Parameters for the PriceProcess controlling price dynamics, e.g.:
-            {
-                "diag_interval": 5000,
-                "init_price": 100.0,
-                # GBM-only
-                "mu": 1e-4,
-                "vol": 0.01,
-                # OU-only
-                "theta": 100.0,
-                "kappa": 0.05,
-                "sigma": 0.02,
-                # Cross-asset correlation
-                "cov_scale": 1.0,
-                "correlation": 0.7,
-                # The rest
-                "impact_eta": 0.0,        # ticks per (trade_size / mm_size)
-                "impact_decay": 0.0,        # 0-1 optional decay towards process anchor
-                "mm_latency_prob": 0.15,
-                "stale_impact_boost": 1.0,
-                "mm_refresh_interval": 50,
-                "mm_refresh_ticks": 1,
-                "markout_steps": 0,
-                "maker_markout_ticks": 0.8,
-                "maker_adverse_eta": 0.3,
-                "bg_liquidity": True,
-                "bg_inside_ticks": 1,
-                "bg_levels": 3,
-                "bg_size": 400.0,
-                "bg_depth_decay": 0.7,
-                "maker_drag_decay": 0.85,
-                "maker_drag_stepcap": 1.5,
-                "impact_max_ticks_per_step": 3.0,
-                "max_anchor_move_ticks": 3.0,
-                "annual_mu": 0.085,
-                "regime_on": True,
-                "regimes": {
-                    "side": {"mu_ann": 0, "vol_mult": 1.0, "p_stay": 0.98},
-                    "bull": {"mu_ann": 0.18, "vol_mult": 0.85, "p_stay": 0.985},
-                    "bear": {"mu_ann": -0.25, "vol_mult": 1.60, "p_stay": 0.975}
-                }
+        Minimum price increment for snapping/quoting.
+    sec_fee_bps_sell : float
+        SEC/transaction bps applied on sells (0 if unused).
 
-                "innovations": "student_t",      # "gaussian" or "student_t"
-                "df": 5,                         # t dof (fat tails)
+    mm_params : dict
+        Market-maker behavior and quoting controls (spread, size, risk, ladder, unwind, fees, etc.).
+    process_params : dict
+        Price dynamics, covariance/correlation, regimes, intraday effects, events, impact, flow model, etc.
+    external_order_params : dict
+        Baseline intensity, mix, Hawkes parameters, and price-linked aggressiveness/size scalers.
 
-                # GARCH(1,1) for daily variance
-                "garch_enabled": True,
-                "garch_omega": 1e-6,
-                "garch_alpha": 0.05,
-                "garch_beta": 0.92,
-
-                # Merton jumps in log-returns
-                "jump_lambda": 0.04,
-                "jump_mu": 0.0,
-                "jump_sigma": 0.03,
-
-                # Intraday U-shape
-                "intraday_u_shape": True,
-                "u_open_close": 1.7,
-                "u_midday": 1.0,
-                "event_times_steps": [],          # e.g., [60, 120, 22800] if you want spikes
-                "event_sigma_mult": 3.0,
-                "event_half_life_secs": 180.0,
-                "basis_enabled": True,
-                "basis_half_life_secs": 90.0,
-                "basis_sigma_ticks": 0.4,
-
-                # Flow impact
-                "micro_trade_impact_eta": 0.0,     # keep old per-trade impact off
-                "flow_impact_enabled": True,
-                "flow_impact_gamma": 0.25,         # ticks per (order_size^alpha) flow
-                "flow_impact_alpha": 0.6,          # concave impact
-                "flow_impact_beta": 120.0,         # per-day decay (roughly 2.25 min half-life @ 1/23400 dt)
-                "flow_cross_rho": 0.3,             # cross-asset mixing
-                "flow_include_mm": False,          # impact from external aggressors only
-                "flow_vol_norm": True,             # divide by current daily vol
-                "flow_shock_cancel_ticks": 0.5,
-            }
-    external_order_params : Dict
-        Parameters governing random external order flow (Poisson arrivals, size, mix), e.g.:
-            {
-                "lambda": 70000,
-                "price_sigma": 0.0005,
-                "offset_tick_sigma": 2.0,
-                "marketable_frac": 0.4,
-                "retail_mu": 5,
-                "inst_mu": 50,
-                "retail_frac": 0.7,
-                "buy_prob": 0.5,
-                "use_price_bias": True,
-                "bias_mode": "ath_contra",
-                "buyprob_alpha": 2.0,
-                "marketable_alpha": 1.0,
-
-                # Hawkes Process Parameters
-                "hawkes_enabled": True,
-                "hawkes_alpha_self": 0.20,        # jump in per-step intensity per same-side event
-                "hawkes_alpha_cross": 0.10,       # jump in per-step intensity per opposide-side event
-                "hawkes_beta": 50.0,              # decay rate per DAY (roughly 5-min half life with dt=1/23400)
-                "hawkes_cap_mult": 5.0,           # cap = cap_mult * baseline (per symbol)
-
-                # Price-linked intensity tilt and aggression/size scalers
-                "trend_eta": 4.0,                 # tilts buy/sell intensities with signed return
-                "vol_eta": 2.0,                   # boosts both intensities with |return|/σ
-                "mkt_trend_slope": 6.0,           # raises p_mkt with trend-aligned move
-                "mkt_vol_slope": 4.0,             # raises p_mkt with |return|/σ
-                "size_vol_slope": 6.0             # scales sizes with |return|/σ
-            }
     fee_rate : float
-        Per-trade fee applied to takers (fraction of notional).
+        Ad-valorem taker fee (fraction of notional).
     rebate_rate : float
-        Rebate paid to makers (fraction of notional).
+        Ad-valorem maker rebate (fraction of notional).
     routing_fee_rate : float
-        Per-trade fee applied to all fills
+        Ad-valorem routing/other fee applied to all fills.
     verbose : bool
-        If True, prints periodic simulation progress and performance summaries.
+        Enable periodic diagnostics.
 
-    # ETF creation/redemption
-    "etf_ap": {
-        "enabled": True,
-        "prem_threshold": 5e-4,
-        "ap_kappa": 10.0,
-        "ap_cost_bps": 2e-4,
-        "sigma_nav_mult": 0.6,
-        "max_ap_flow_per_day": 0.05
-        }
-
-    # Per-share fees (USD per share, set to 0 if not needed)
-    per_share_fees: Dict[str, float] = field(default_factory=lambda: {
-        "taker": 0.0028,
-        "maker": 0.0014,
-        "routing": 0.0003,
-        "clearing": 0.0002,
-        "finra_taf_ps": 0.000119,     #sells only
-        "finra_taf_cap": 5.95,         # max per execution
-    })
+    etf_ap : dict
+        Optional ETF creation/redemption tether (premium/discount control).
+    per_share_fees : dict[str, float]
+        Per-share maker/taker/routing/clearing and FINRA TAF settings.
     """
     symbols: List[str] = field(default_factory=lambda: ["SPY"])
     steps: int = 1000
@@ -394,14 +245,12 @@ class SimulationConfig:
 
 class BaseProcess(abc.ABC):
     """
-    Abstract base class for all stochastic price processes.
+    Abstract interface for stochastic midprice generators.
 
-    Subclasses must implement:
-        step() → advances one simulation timestep
-                    and returns a dictionary mapping
-                    symbol → updated price.
-    
-    Subclasses can optionally accept a SimulationConfig for parameterized setup.
+    Subclasses must implement
+    -------------------------
+    step() -> dict[str, float]
+        Advance one step and return updated midprices keyed by symbol.
     """
     def __init__(self, config: Optional[SimulationConfig] = None):
         self.config = config
@@ -421,12 +270,12 @@ class BaseProcess(abc.ABC):
 
 class BaseAgent(abc.ABC):
     """
-    Abstract base class for all trading agents.
+    Abstract interface for agents that act each simulation step.
 
-    Subclasses must implement:
-        act() → define agent behavior at each simulation step.
-
-    Subclasses can optionally accept a SimulationConfig for parameterized setup.
+    Subclasses must implement
+    -------------------------
+    act() -> None
+        Perform per-step logic (quoting, hedging, etc.).
     """
     def __init__(self, config: Optional[SimulationConfig] = None):
         self.config = config
@@ -450,22 +299,23 @@ class BaseAgent(abc.ABC):
 @dataclass
 class Order:
     """
-    Represents a single limit or market order.
+    Limit/market order object.
 
     Attributes
     ----------
     symbol : str
-        Asset identifier.
     price : float
-        The quoted order price (rounded to tick size if config provided).
+        Snapped to tick grid on insertion.
     size : float
-        Quantity to buy or sell.
-    side : {'buy', 'sell'}
-        Order direction.
-    trader : str, optional
-        Owner identifier ('external' or 'mm').
+    side : {"buy","sell"}
+    trader : str
+        Identifier ("external", "mm", "bg", ...).
     timestamp : float
-        Creation time (UNIX seconds).
+        Logical time used for time-priority within a price level.
+
+    Notes
+    -----
+    Use `Order.from_config(...)` to ensure tick-aligned construction.
     """
     symbol: str
     price: float
@@ -528,30 +378,30 @@ class Order:
 @dataclass
 class Trade:
     """
-    Represents an executed trade.
+    Executed trade record with fee/rebate accounting.
 
     Attributes
     ----------
     symbol : str
-        Asset identifier.
     price : float
-        Execution price.
-    size: float
-        Execution size.
-    buyer : str
-        Trader ID of the buyer.
-    seller : str
-        Trader ID of the seller.
-    timestamp : float
-        Execution timestamp.
-    liquidity_flag : {'maker', 'taker'}
-        Optional tag for fee computation.
-    fee_rate : float
-        Trading fee applied to takers.
-    rebate_rate : float
-        Rebate received by makers.
-    maker : str 
-        Maker ID tag for fee computation.
+    size : float
+    buyer, seller : str
+        Trader identifiers; either may be "mm".
+    liquidity_flag : {"maker","taker"}
+        Perspective for fee/rebate sign.
+    fee_rate, rebate_rate : float
+        Ad-valorem taker fee / maker rebate used for `fee`.
+    maker : str
+        Which side supplied resting liquidity ("mm" or other).
+    bid_px, ask_px : float | None
+        Top-of-book snapshot when matched.
+    aggressor, aggressor_side : str | None
+        Initiator metadata for impact/flow bookkeeping.
+    resting_side : {"buy","sell"} | None
+    stale : bool
+        Whether the MM quote was flagged stale at fill time.
+    step : int | None
+        Simulation step index of the trade.
     """
     symbol: str
     price: float
@@ -617,28 +467,20 @@ class Trade:
 
 class OrderBook:
     """
-    Simplified limit order book supporting multiple assets.
+    Minimal L2 book per symbol with price-time priority and optional
+    background depth.
 
-    Attributes
+    Responsibilities
+    ----------------
+    - Insert/cancel orders with tick snapping and side-sorted queues.
+    - Cross the book to produce `Trade` objects.
+    - Provide best bid/ask, depth/imbalance, and execute market orders.
+    - Maintain synthetic midprice per symbol (updated by process/impact).
+
+    Parameters
     ----------
-    _books : Dict[str, Dict[str, List[Order]]]
-        Nested dict: {symbol: {'buy' : [...], 'sell' : [...]}}
-    _mid_prices : Dict[str, float]
-        Current synthetic midprice per asset.
     config : SimulationConfig
-        Provides tick size, depth limit, and matching preferences.
-
-        
-    Methods
-    -------
-    place_order(order: Order, symbol: str)
-        Insert order into the correct book side, sorted.
-    
-    match_orders(symbol: str)
-        Match best bid/ask; return executed trades.
-
-    update_midprice(symbol: str, new_price: float)
-        Refresh midprice after simulated price dynamics or trades.
+        Supplies symbols, tick size, depth, and MM queue share.
     """
     def __init__(self, config: SimulationConfig):
         self.config = config
@@ -683,12 +525,8 @@ class OrderBook:
     # --- Core Methods ---
     def place_order(self, symbol: str, order: Order):
         """
-        Add an order to the right side and maintain sorted order book per side.
-        
-        Respects depth and tick-size rules.
-
-        Buys are sorted descending (highest bid first).
-        Sells are sorted ascending (lowest ask first).
+        Insert an order, snap to tick, and keep side sorted by price then time.
+        Respects `max_depth` per side; least-priority orders drop when capped.
         """
         if symbol not in self._books:
             raise ValueError(f"Unknown symbol '{symbol}'.")
@@ -710,12 +548,12 @@ class OrderBook:
 
     def match_orders(self, symbol: str) -> List[Trade]:
         """
-        Match top of book orders and return executed trades.
+        Cross best bid/ask until uncrossed; return trades.
 
-        Returns
-        -------
-        trades : List[Trade]
-            List of executed trades during this call
+        Matching rule
+        -------------
+        - Price-time priority within each side.
+        - Maker side determined by earlier timestamp at the crossed price.
         """
         book = self._books[symbol]
         buys, sells = book["buy"], book["sell"]
@@ -769,6 +607,10 @@ class OrderBook:
 
 
     def execute_market(self, symbol: str, side: str, size: float, trader: str):
+        """
+        Sweep the opposite side level by level using a pro-rata split between
+        MM and non-MM liquidity at each price. Returns the resulting trades.
+        """
         opp = "sell" if side == "buy" else "buy"
         fills = []
         while size > 1e-9 and self._books[symbol][opp]:
@@ -896,31 +738,20 @@ class OrderBook:
 
 class PriceProcess(BaseProcess):
     """
-    Simulates midprice evolution for each asset.
+    Correlated midprice evolution with optional regimes, GARCH(1,1),
+    Merton jumps, intraday U-shape/events, ETF AP tether, and impact
+    hooks. Supports OU (mean-reverting level) and GBM (log-diffusion).
 
-    Supports correlated OU (mean-reverting) or GBM (diffusive) processes.
-
-    Parameterized by SimulationConfig.
-
-    Attributes
+    Parameters
     ----------
     config : SimulationConfig
-        Simulation-wide configuration.
-    _symbols : List[str]
-        Tracked asset identifiers.
-    _dt : float
-        Simulation timestep (fraction of a trading day).
-    _model : str
-        Type of stochastic process ('OU' or 'GBM').
-    _prices: np.ndarray
-        Current midprice vector.
-    _cov : np.ndarray
-        Covariance matrix defining inter-asset correlations.
+        Reads `process_params` and symbol list.
 
-    Methods
-    -------
-    step()
-        Advance one time step and return updated midprices.
+    Notes
+    -----
+    - `prices` property returns the current midprice dict.
+    - `step()` mutates internal state and should be called exactly once
+    per simulation step.
     """
 
     def __init__(self, config: SimulationConfig):
@@ -945,7 +776,7 @@ class PriceProcess(BaseProcess):
         corr = self._params.get("correlation", 0.7)
         self._cov = self._build_cov_matrix(n, self._params.get("correlation", 0.7))
 
-        # innovations + GARCH`
+        # innovations + GARCH
         self._steps_per_day = max(1, int(round(1.0 / self._dt)))
         self._acc_z = np.zeros(n)
         self._t_in_day = 0
@@ -1033,14 +864,10 @@ class PriceProcess(BaseProcess):
     # Core price evolution
     def step(self) -> Dict[str, float]:
         """
-        Simulate one step of correlated price movement.
-
-        The volatility is scaled appropriately for dt granularity.
-
-        Returns
-        -------
-        Dict[str, float]
-            Updated midprices for all symbols.
+        Advance one time step: draw correlated shocks, apply regime drift and
+        volatility scaling (intraday/event), update OU level or GBM log price,
+        apply jumps and (if enabled) daily GARCH variance recursion; then
+        apply ETF AP tether and clamp to a positive floor. Returns midprices.
         """
         n = len(self._symbols)
         z = self._random_noise(n, self._cov, self._innov, self._df) * math.sqrt(self._cov_scale)
@@ -1178,43 +1005,15 @@ class PriceProcess(BaseProcess):
 
 class MarketMaker(BaseAgent):
     """
-    Configurable liquidity-providing agent quoting bid/ask prices 
-    around mid and adapting spreads dynamically based on volatility
-    and inventory (Avellaneda-Stoikov style).
+    Quoting/hedging agent with a multi-level ladder and risk-based
+    spread/size adaptations (Avellaneda–Stoikov-inspired). Tracks
+    inventory, cash, fees/rebates, realized PnL, and conservative MTM.
 
-    Attributes
-    ----------
-    config : SimulationConfig
-        Global simulation parameters.
-    symbols : List[str]
-        Assets the market maker trades.
-    _inventory : Dict[str, float]
-        Current position per asset.
-    _cash : float
-        Account cash balance.
-    _base_spread : float
-        Initial symmetric spread
-    _order_size : float
-        Size per quote
-    _gamma : float
-        Risk-aversion coefficient
-    _inventory_limit : float
-        Maximum absolute inventory per asset
-
-        
-    Methods
-    -------
-    quote(symbol, , volatility)
-        Generate bid/ask quotes for a symbol given mid and volatility estimate.
-
-    update_inventory(trades)
-        Adjust inventory and cash based on executed trades.
-
-    adapt_spread(volatility, inventory)
-        Dynamically adjust spread based on volatility and inventory risk.
-    
-    act()
-        Placeholder required by BaseAgent.
+    Key controls (from config.mm_params)
+    ------------------------------------
+    spread, size, risk_aversion, vol_sensitivity, inventory_limit,
+    levels, level_step_ticks, depth_decay, inventory_skew_gamma,
+    taker_unwind_* (IOC hedging), quote_update_cost_ps, etc.
     """
     def __init__(self, config: SimulationConfig):
         super().__init__(config)
@@ -1265,12 +1064,9 @@ class MarketMaker(BaseAgent):
     # --- Methods ---
     def quote(self, symbol: str, mid: float, volatility: float = 0.02) -> Tuple[Optional[Order], Optional[Order]]:
         """
-        Return a bid and ask Order around the current midprice.
-        
-        Features:
-            - Smoothly reduces order size as inventory approaches limit.
-            - Widens spread based on volatility and inventory pressure.
-            - Stops quoting entirely if at the hard boundary.
+        Single-level bid/ask around mid with volatility/inventory-aware
+        spread and gamma-based skew. Respects hard inventory limits and
+        ensures tick-aligned prices.
         """
         inv = self._inventory[symbol]
         lim = self._inventory_limit
@@ -1342,14 +1138,9 @@ class MarketMaker(BaseAgent):
 
     def update_inventory(self, trades: List[Trade]):
         """
-        Update inventory and cash from executed trades.
-        Positive size = buy (long inventory), negative = sell (reduce inventory).
-
-        Fee model:
-        - The MM always pays a routing/clearing cost on its fills: fee_rate * notional
-        - The MM receives a maker rebate only when it was the resting (maker) side
-          on that trade: rebate_rate * notional
-        - Net cash fee impact = rebate_if_maker - taker_fee - routing_cost
+        Apply fills to inventory/cash and post fees/rebates using per-share
+        and ad-valorem settings. Buys increase inventory and reduce cash;
+        sells do the opposite.
         """
         taker_rate = self.config.fee_rate
         maker_rebate = self.config.rebate_rate
@@ -1397,6 +1188,11 @@ class MarketMaker(BaseAgent):
 
 
     def quote_ladder(self, symbol: str, mid: float, volatility: float=0.02):
+        """
+        Build a symmetric K-level ladder with geometric size decay and
+        per-level tick spacing. Size shrinks as inventory approaches limits;
+        inventory skew shifts the ladder.
+        """
         inv = self._inventory[symbol]; lim = self._inventory_limit
         x = inv / lim; inv_abs = abs(x)
         spread = self.adapt_spread(volatility, inv)
@@ -1470,32 +1266,21 @@ class MarketMaker(BaseAgent):
 
 class MarketSimulation:
     """
-    Orchestrates the entire market simulation.
+    Orchestrates the simulation loop: evolve prices, (re)quote the MM,
+    generate external flow, match orders, apply impact/flow feedback,
+    update inventory/cash, and record PnL with diagnostics.
 
-    Components:
-        - PriceProcess : models underlying price dynamics.
-        - OrderBook : maintains order flow and trade execution.
-        - MarketMaker : provides continuous liquidity.
-        - ExternalFlow: synthetic external orders (stochastic intensity).
+    Parameters
+    ----------
+    config : SimulationConfig
+        Complete configuration for process, book, MM, and flow.
 
-    Controlled entirely by SimulationConfig.
-
-    Methods
-    -------
-    from_config(config)
-        Factory method to construct a simulation from config dict.
-
-    run()
-        Run simulation for N steps; collect stats.
-    
-    generate_external_orders()
-        Randomly create external buy/sell orders.
-    
-    compute_pnl()
-        Calculate cumulative PnL and performance metrics.
-
-    plot_results(df)
-        Static utility for plotting results.
+    Attributes
+    ----------
+    trades : list[Trade]
+        All executions (including IOC hedges).
+    pnl_history : list[dict]
+        Per-step cash/inventory/equity breakdown used by `compute_pnl`.
     """
     def __init__(self, config: SimulationConfig):
         np.random.seed(config.seed)
@@ -1701,7 +1486,7 @@ class MarketSimulation:
     
 
     def _apply_trade_cost_basis(self, t: Trade) -> float:
-        """Average-cost realized PnL with separate long/short buckets."""
+        """Two-bucket average cost (separate long/short) to compute realized PnL."""
         if "mm" not in (t.buyer, t.seller):
             return 0.0
         s, px, qty = t.symbol, float(t.price), float(t.size)
@@ -1803,6 +1588,7 @@ class MarketSimulation:
 
 
     def _mm_ioc_hedge(self) -> List[Trade]:
+        """Immediate-or-cancel hedges when inventory breaches, stale edge exists, or target skew is hit."""
         fills = []
         clip = float(self.config.mm_params["size"])
         min_frac = float(self.config.mm_params.get("min_unwind_frac", 0.10))
@@ -1861,6 +1647,7 @@ class MarketSimulation:
 
 
     def _maybe_mm_unwind(self) -> List[Trade]:
+        """Secondary unwind path when `taker_unwind_enabled` is True and inventory exceeds trigger."""
         if not self._tw_enabled:
             return []
         fills: List[Trade] = []
@@ -1886,6 +1673,11 @@ class MarketSimulation:
 
 
     def generate_external_orders(self, step: int) -> List[Tuple[str, Order]]:
+        """
+        Sample Poisson counts per side with Hawkes self/cross excitation,
+        tilt intensities by trend/vol and book imbalance, and create either
+        marketable sweeps or passive limits with stochastic offsets/sizes.
+        """
         orders: List[Tuple[str, Order]] = []
 
         for s in self.symbols:
@@ -1994,6 +1786,7 @@ class MarketSimulation:
 
 
     def _apply_trade_impact(self, step_trades: List[Trade]) -> None:
+        """Micro impact from aggressor volume; stale/MM-made fills amplify adverse ticks."""
         if self.micro_eta <= 0 or not step_trades:
             return
         max_ticks_per_step = float(self.config.process_params.get("impact_max_ticks_per_step", 3.0))
@@ -2037,6 +1830,7 @@ class MarketSimulation:
 
 
     def _apply_flow_impact(self, step_trades: List[Trade]) -> None:
+        """Concave, decaying signed flow memory with cross-asset mixing to nudge midprices in ticks."""
         if not self.flow_impact_on:
             return
         
@@ -2092,6 +1886,7 @@ class MarketSimulation:
 
 
     def _apply_maker_markout_penalty(self, step_trades: List[Trade]) -> None:
+        """Accrue short-term drag when MM is adversely selected; decays via `_apply_maker_drag`."""
         ticks_per_clip = float(self.config.process_params.get("maker_markout_ticks", 1.2))
         base = max(1e-9, getattr(self.market_maker, "_order_size", 1.0))
         for t in step_trades:
@@ -2113,6 +1908,7 @@ class MarketSimulation:
 
 
     def _decay_impact(self) -> None:
+        """Mean-revert synthetic mid back toward process anchor with a per-step cap."""
         if self.impact_decay <= 0:
             return
         intr = float(getattr(self.price_process, "_last_intraday", 1.0))
@@ -2129,12 +1925,12 @@ class MarketSimulation:
 
     def run(self):
         """
-        Main simulation loop:
-            - Advance price process
-            - Market maker quotes bid/ask
-            - Generate external orders
-            - Match trades 
-            - Update inventory, cash, PnL
+        Main loop for `steps` iterations:
+        1) advance `PriceProcess`; 2) background depth; 3) MM quote (with
+        refresh cadence and cost) and external flow (with optional MM
+        latency flag setting quotes stale); 4) match + IOC hedges; 5)
+        impact/flow feedback and maker mark-out drag; 6) fees, EOD
+        inventory penalty, conservative MTM; 7) diagnostics snapshot.
         """
         for step in range(self.steps):
             self._reset_step_diag()
@@ -2360,12 +2156,9 @@ class MarketSimulation:
     # --- Metrics ---
     def compute_pnl(self) -> pd.DataFrame:
         """
-        Compute mark-to-market equity and key performance metrics.
-
-        Returns
-        -------
-        pd.DataFrame
-            Contains columns with PnL components and summary stats.
+        Build a per-step PnL DataFrame and compute daily stats
+        (Sharpe/Sortino, drawdown, turnover, hit ratio, CAGR). Adds a
+        `summary` dict to `df.attrs`.
         """
         df = pd.DataFrame(self.pnl_history)
         if df.empty:
@@ -2566,7 +2359,7 @@ if __name__ == "__main__":
             "risk_aversion": 0.05,
             "vol_sensitivity": 2.0,
             "initial_cash": 5_000_000.0,
-            "inventory_limit": 20000.0,
+            "inventory_limit": 15000.0,
             "inventory_penalty": 2.0,
             "min_unwind_frac": 0.25,
             "levels": 5,
@@ -2576,8 +2369,8 @@ if __name__ == "__main__":
             "queue_jitter": 0.01,
             "risk_horizon_secs": 300,
             "taker_unwind_enabled": True,
-            "taker_unwind_trigger": 0.6,
-            "taker_unwind_target": 0.30,
+            "taker_unwind_trigger": 0.5,
+            "taker_unwind_target": 0.20,
             "taker_unwind_max_clips": 2,
             "taker_unwind_stale_mult": 2.0,
             "adverse_mm_ticks": 0.1,
@@ -2592,7 +2385,7 @@ if __name__ == "__main__":
             "diag_interval": 5000,
             "init_price": 100.0,
             "mu": 1e-4,
-            "vol": 0.015,
+            "vol": 0.0125,
             "theta": 100.0,
             "kappa": 0.05,
             "sigma": 0.02,
@@ -2600,7 +2393,7 @@ if __name__ == "__main__":
             "cov_scale": 1.0,
             "impact_eta": 0.0,
             "impact_decay": 0.01,
-            "mm_latency_prob": 0.05,
+            "mm_latency_prob": 0.15,
             "stale_impact_boost": 1.5,
             "mm_refresh_interval": 10,
             "mm_refresh_ticks": 0.5,
@@ -2612,7 +2405,7 @@ if __name__ == "__main__":
             "garch_beta": 0.92,
             "jump_lambda": 0.03,
             "jump_mu": 0.0,
-            "jump_sigma": 0.04,
+            "jump_sigma": 0.03,
             "intraday_u_shape": True,
             "u_open_close": 1.7,
             "u_midday": 1.0,
@@ -2632,8 +2425,8 @@ if __name__ == "__main__":
             "flow_vol_norm": True,
             "flow_shock_cancel_ticks": 0.5,
             "markout_steps": 0,
-            "maker_markout_ticks": 0.4,
-            "maker_adverse_eta": 0.5,
+            "maker_markout_ticks": 0.6,
+            "maker_adverse_eta": 0.6,
             "bg_liquidity": True,
             "bg_inside_ticks": 2,
             "bg_levels": 4,
@@ -2653,12 +2446,12 @@ if __name__ == "__main__":
         },
 
         "external_order_params": {
-            "lambda": 20000,
+            "lambda": 15000,
             "price_sigma": 0.0005,
             "offset_tick_sigma": 1,
-            "marketable_frac": 0.45,
+            "marketable_frac": 0.40,
             "retail_mu": 5,
-            "inst_mu": 75,
+            "inst_mu": 50,
             "retail_frac": 0.7,
             "buy_prob": 0.52,
             "use_price_bias": True,
@@ -2696,7 +2489,7 @@ if __name__ == "__main__":
         # Per-share fees (USD per share, set to 0 if not needed)
         "per_share_fees": {
             "taker": 0.0030,
-            "maker": 0.0010,
+            "maker": 0.0015,
             "routing": 0.00005,
             "clearing":0.00020,
             "finra_taf_ps": 0.000119,
@@ -2723,5 +2516,3 @@ if __name__ == "__main__":
 
     # --- Plot or save results---
     sim.plot_results(df_pnl)
-
-    
