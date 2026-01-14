@@ -1,11 +1,11 @@
-# Ignore everything by default
+# Ignore everything
 **
 
 # Keep only these
 !.gitignore
 !README.md
 
-# Keep exactly the market-making file (adjust name if needed)
+# Keep MM file
 !src/
 !src/strategies/
 !src/strategies/market_maker_sim.py
